@@ -1,0 +1,234 @@
+#!%%RUBY%% -W
+# -*-coding: utf-8;-*-
+#
+# Copyright (c) 2006-2020, Yasuhiro KIMURA
+# All rights reserved.
+# 
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice, this
+#    list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+#    this list of conditions and the following disclaimer in the documentation
+#    and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+require 'syslog'
+require 'etc'
+
+class PFSyslogger
+
+  PROGRAM_NAME = $0.split('/')[-1]
+  SYSLOG_IDENT = PROGRAM_NAME
+  SYSLOG_OPTIONS = Syslog::LOG_PID | Syslog::LOG_CONS | Syslog::LOG_NDELAY
+  SYSLOG_FACILITY = Syslog::LOG_SECURITY
+  UNPRIVILEGED_USER = "%%UNPRIVILEGED_USER%%"
+  TCPDUMP = "%%TCPDUMP%%"
+  PFLOG_INTERFACE = "%%PFLOG_INTERFACE%%"
+  TCPDUMP_ARGS = "-elnt -i #{PFLOG_INTERFACE} -Z #{UNPRIVILEGED_USER}"
+  MAX_FORWARDING_RETRY = 20
+
+  def initialize
+    @childpid = nil
+    start_syslog
+    check_root_privilege
+    get_id_of_unprivileged_user
+  end
+
+  def start_syslog
+    begin
+      Syslog.open(SYSLOG_IDENT, SYSLOG_OPTIONS, SYSLOG_FACILITY)
+    rescue RunTimeError => e
+      $stderr.puts("cannot open syslog: #{e.message}")
+      $stderr.puts("#{PROGRAM_NAME} exits with error.")
+      Syslog.close
+      exit(false)
+    end
+    Syslog.info("#{PROGRAM_NAME} is started.")
+  end
+
+  def check_root_privilege
+    if Process.euid != 0
+      error_exit("Root privilege is required.")
+    end
+  end
+
+  def get_id_of_unprivileged_user
+    begin
+      entry = Etc.getpwnam(UNPRIVILEGED_USER)
+    rescue ArgumentError => e
+      error_exit("cannot get password entry of #{UNPRIVILEGED_USER}: #{e.message}")
+    end
+    @unprivileged_uid = entry.uid
+    @unprivileged_gid = entry.gid
+  end
+
+  def error_exit(msg)
+    Syslog.err(msg)
+    Syslog.err("#{PROGRAM_NAME} exits with error.")
+    stop_syslog
+    exit(false)
+  end
+
+  def stop_syslog
+    begin
+      Syslog.close
+    rescue
+    end
+  end
+  
+  def start
+    daemonize
+    setup_signal_handler
+    enter_main_loop
+  end
+
+  def daemonize
+    Syslog.info("switching to daemon mode.")
+    begin
+      Process.daemon
+    rescue => e
+      error_exit("failed to switch to daemon mode: #{e.message}")
+    end
+    Syslog.info("daemon mode started.")
+  end
+
+  def setup_signal_handler
+    handler = Proc.new do
+      if @childpid
+        begin
+          Process.kill(15, @childpid)
+        rescue => e
+          err_exit("Failed to kill child process: #{e.message}")
+        end
+        begin
+          Process.waitpid(@childpid)
+        rescue => e
+          err_exit("Error while waiting child process #{@childpid} to exit: #{e.message}")
+        end
+      end
+      Syslog.info("#{PROGRAM_NAME} exits normally.")
+      stop_syslog
+      exit(true)
+    end
+    Signal.trap(:HUP, handler)
+    Signal.trap(:INT, handler)
+    Signal.trap(:QUIT, handler)
+    Signal.trap(:TERM, handler)
+  end
+
+  def enter_main_loop
+    0.upto(MAX_FORWARDING_RETRY) do |count|
+      if count == 0
+        Syslog.info("start log forwarding process.")
+      else
+        Syslog.info("restart log forwarding process.")
+      end
+      forward_pf_log
+    end
+    error_exit("failure of log forwarding process has reached max retry count.")
+  end
+
+  def forward_pf_log
+    begin
+      r, w = IO.pipe
+    rescue => e
+      error_exit("cannot create pipe: #{e.message}")
+    end
+    begin 
+      @childpid = Process.fork
+    rescue => e
+      error_exit("cannot fork: #{e.message}")
+    end
+    if @childpid
+      Syslog.info("child process started. pid is #{@childpid}.")
+      handler = Proc.new do
+        Signal.trap(:CHLD, "DEFAULT")
+        r.close
+      end
+      Signal.trap(:CHLD, handler)
+      w.close
+      drop_privilege
+      begin
+        r.each_line do |line|
+          Syslog.info(line)
+        end
+      rescue IOError
+      end
+      Syslog.warning("child process #{@childpid} has exited.")
+      recover_privilege
+    else
+      r.close
+      STDOUT.reopen(w)
+      exec("#{TCPDUMP} #{TCPDUMP_ARGS}")
+      w.close
+      error_exit("cannot exec #{TCPDUMP}")
+    end
+  end
+
+  def drop_privilege
+    begin
+      Process.gid = @unprivileged_gid
+    rescue => e
+      error_exit("failed to set real group id to #{@unprivileged_gid}: #{e.message}")
+    end
+    begin
+      Process.egid = @unprivileged_gid
+    rescue => e
+      error_exit("failed to set effective group id to #{@unprivileged_gid}: #{e.message}")
+    end
+    begin
+      Process.uid = @unprivileged_uid
+    rescue => e
+      error_exit("failed to set real user id to #{@unprivileged_uid}: #{e.message}")
+    end
+    begin
+      Process.euid = @unprivileged_uid
+    rescue => e
+      error_exit("failed to set effective user id to #{@unprivileged_uid}: #{e.message}")
+    end
+  end
+
+  def recover_privilege
+    begin
+      Process.euid = 0
+    rescue => e
+      error_exit("failed to set effective user id to 0: #{e.message}")
+    end
+    begin
+      Process.uid = 0
+    rescue => e
+      error_exit("failed to set real user id to 0: #{e.message}")
+    end
+    begin
+      Process.egid = 0
+    rescue => e
+      error_exit("failed to set effective group id to 0: #{e.message}")
+    end
+    begin
+      Process.gid = 0
+    rescue => e
+      error_exit("failed to set real group id to 0: #{e.message}")
+    end
+  end
+
+end
+
+logger = PFSyslogger.new
+logger.start
+
+# Local Variables:
+# mode: ruby
+# End:
